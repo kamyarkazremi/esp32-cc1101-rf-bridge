@@ -1,0 +1,323 @@
+substitutions:
+  device_name: esp32-rf433-bridge
+  friendly_name: "ESP32 CC1101 RF433 Bridge"
+
+  # RF Parameters (Section 3)
+  rf_frequency_mhz: "433.92"
+  rf_rx_bw_khz: "812.50"
+  rf_tx_power_dbm: "10"
+
+  # ---------------------------------------------------------------------------
+  # 24-bit EV1527 / PT2262 Codes
+  # Captured Wall Switch Gang 1: 101000001110011110100100 (0xA0E7A4)
+  #   20-bit EV1527 Address: 10100000111001111010 (0xA0E7A)
+  #   4-bit Button Data:     0100 (0x4)
+  # ---------------------------------------------------------------------------
+  wall_switch_gang_1_code: "101000001110011110100100"
+  wall_switch_gang_2_code: "101000001110011110100010"
+  wall_switch_gang_3_code: "101000001110011110100001"
+
+  # Optional: Codes transmitted by ESP32 to toggle/pair the 10A AC RF Relay Module
+  ac_relay_1_toggle_code: "101000001110011110100100"
+  ac_relay_1_on_code:     "101000001110011110100100"
+  ac_relay_1_off_code:    "101000001110011110100010"
+  ev1527_pulse_length_us: "350"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  libraries:
+    - SPI
+    - "SmartRC-CC1101-Driver-Lib"
+  platformio_options:
+    build_src_flags:
+      - "-include ELECHOUSE_CC1101_SRC_DRV.h"
+      - "-include soc/gpio_struct.h"
+  # ---------------------------------------------------------------------------
+  # Task Step 1: Initialize CC1101 over SPI at Boot (Priority 600)
+  # Pinout: SCK=18, MISO=19, MOSI=23, CSN=5, GDO0=4
+  # ---------------------------------------------------------------------------
+  on_boot:
+    priority: 600.0
+    then:
+      - lambda: |-
+          pinMode(19, INPUT_PULLUP);
+          delay(2);
+          ELECHOUSE_cc1101.setSpiPin(18, 19, 23, 5);
+          ELECHOUSE_cc1101.setGDO0(4);
+          ELECHOUSE_cc1101.Init();
+          ELECHOUSE_cc1101.setCCMode(0);
+          ELECHOUSE_cc1101.setModulation(2);
+          ELECHOUSE_cc1101.setMHZ(${rf_frequency_mhz});
+          ELECHOUSE_cc1101.setRxBW(${rf_rx_bw_khz});
+          ELECHOUSE_cc1101.setPA(${rf_tx_power_dbm});
+          // Route Asynchronous Serial Data Output (0x0D) to GDO0 (Pin 3 -> GPIO4)
+          ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D);
+          ELECHOUSE_cc1101.SetRx();
+          // Ensure GPIO4 output driver is disabled so remote_receiver reads GDO0
+          GPIO.enable_w1tc = (1ULL << 4);
+          delay(2);
+          bool ok = ELECHOUSE_cc1101.getCC1101();
+          byte part = ELECHOUSE_cc1101.SpiReadStatus(0x30);
+          byte ver = ELECHOUSE_cc1101.SpiReadStatus(0x31);
+          byte marc = ELECHOUSE_cc1101.SpiReadStatus(0x35);
+          byte iocfg0 = ELECHOUSE_cc1101.SpiReadReg(CC1101_IOCFG0);
+          ESP_LOGI("cc1101", "CC1101 Init -> PARTNUM=0x%02X, VERSION=0x%02X, IOCFG0=0x%02X, MARCSTATE=0x%02X (0x0D=RX), getCC1101=%s",
+                   part, ver, iocfg0, marc, ok ? "OK" : "FAIL");
+          id(cc1101_spi_status).publish_state(ok);
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}-fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+globals:
+  - id: gang1_last_packet_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: gang1_last_press_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: gang1_last_action
+    type: std::string
+    restore_value: no
+    initial_value: '"single_press"'
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    bssid:
+      name: "Connected BSSID"
+  - platform: template
+    id: last_rf_code
+    name: "Last Received RF433 Code"
+    icon: "mdi:barcode-scan"
+
+# =============================================================================
+# Task Step 2: Configure remote_receiver on GDO0 (GPIO 4)
+# =============================================================================
+remote_receiver:
+  id: rf_receiver
+  pin:
+    number: GPIO4
+    mode:
+      input: true
+  dump:
+    - rc_switch
+  tolerance: 50%
+  filter: 200us
+  idle: 4ms
+  buffer_size: 4kb
+  on_rc_switch:
+    then:
+      - lambda: |-
+          // Ignore partial/truncated tail frames (< 20 bits significant)
+          if (x.code < 0x100000ULL) {
+            return;
+          }
+          std::string bin_str = "";
+          for (int i = 23; i >= 0; i--) {
+            bin_str += ((x.code >> i) & 1ULL) ? '1' : '0';
+          }
+          ESP_LOGI("rf433_sniffer", "Decoded RF433 EV1527/RCSwitch: code='%s' (proto=%u, hex=0x%llX)",
+                   bin_str.c_str(), x.protocol, x.code);
+          id(last_rf_code).publish_state(bin_str);
+
+          // Check if this is Wall Switch Gang 1 (101000001110011110100100 = 0xA0E7A4)
+          if (x.code == 0xA0E7A4ULL) {
+            uint32_t now = millis();
+            uint32_t since_last_pkt = now - id(gang1_last_packet_ms);
+            id(gang1_last_packet_ms) = now;
+            id(wall_switch_gang_1).publish_state(true);
+
+            // A new physical button press has > 220ms of silence since the previous RF burst ended
+            if (since_last_pkt > 220) {
+              uint32_t since_last_press = now - id(gang1_last_press_ms);
+              if (id(gang1_last_press_ms) > 0 && since_last_press <= 1300) {
+                id(gang1_last_action) = "double_press";
+                id(gang1_last_press_ms) = 0;
+                ESP_LOGI("wall_switch", "Gang 1 FAST DOUBLE PRESS (%u ms since first press) -> 100%% Brightness", since_last_press);
+              } else {
+                id(gang1_last_action) = "single_press";
+                id(gang1_last_press_ms) = now;
+                ESP_LOGI("wall_switch", "Gang 1 SINGLE PRESS -> Toggle Bedroom Light");
+              }
+              id(fire_gang1_ha_event).execute();
+            }
+          }
+
+script:
+  - id: fire_gang1_ha_event
+    mode: queued
+    then:
+      - homeassistant.event:
+          event: esphome.rf433_button_pressed
+          data:
+            device: "${device_name}"
+            gang: "1"
+            code: "${wall_switch_gang_1_code}"
+            action: !lambda "return id(gang1_last_action);"
+
+  - id: transmit_ev1527_code
+    parameters:
+      code_str: string
+    then:
+      - lambda: |-
+          const uint32_t T = ${ev1527_pulse_length_us};
+          // Configure GDO0 as High-Z input (0x2E) for Async TX
+          ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x2E);
+          ELECHOUSE_cc1101.SetTx();
+          delayMicroseconds(800);
+          // Enable GPIO4 output buffer without disturbing RMT RX input matrix
+          GPIO.out_w1tc = (1ULL << 4);
+          GPIO.enable_w1ts = (1ULL << 4);
+          for (int rep = 0; rep < 6; rep++) {
+            for (char c : code_str) {
+              if (c == '1') {
+                GPIO.out_w1ts = (1ULL << 4);
+                delayMicroseconds(T * 3);
+                GPIO.out_w1tc = (1ULL << 4);
+                delayMicroseconds(T * 1);
+              } else {
+                GPIO.out_w1ts = (1ULL << 4);
+                delayMicroseconds(T * 1);
+                GPIO.out_w1tc = (1ULL << 4);
+                delayMicroseconds(T * 3);
+              }
+            }
+            // EV1527 sync [1, 31]
+            GPIO.out_w1ts = (1ULL << 4);
+            delayMicroseconds(T * 1);
+            GPIO.out_w1tc = (1ULL << 4);
+            delayMicroseconds(T * 31);
+          }
+          // Release GPIO4 output buffer back to pure input and restore RX on GDO0
+          GPIO.enable_w1tc = (1ULL << 4);
+          ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D);
+          ELECHOUSE_cc1101.SetRx();
+          ESP_LOGI("cc1101", "Transmitted EV1527 code '%s' and restored RX mode (IOCFG0=0x0D)", code_str.c_str());
+
+# =============================================================================
+# Task Step 3: Expose Wall Switch Gangs & Diagnostics to Home Assistant
+# =============================================================================
+binary_sensor:
+  # Diagnostic entity indicating whether the CC1101 passed SPI verification at boot
+  - platform: template
+    id: cc1101_spi_status
+    name: "CC1101 SPI Transceiver Status"
+    device_class: connectivity
+    entity_category: diagnostic
+
+  # Gang 1 Button (Captured EV1527 Code: 101000001110011110100100 / 0xA0E7A4)
+  - platform: template
+    id: wall_switch_gang_1
+    name: "Wall Switch Gang 1"
+    icon: "mdi:light-switch"
+    filters:
+      - delayed_off: 250ms
+
+  # Gang 2 Button (EV1527 / PT2262 24-bit)
+  - platform: remote_receiver
+    id: wall_switch_gang_2
+    name: "Wall Switch Gang 2"
+    icon: "mdi:light-switch"
+    rc_switch_raw:
+      code: "${wall_switch_gang_2_code}"
+      protocol:
+        pulse_length: ${ev1527_pulse_length_us}
+        sync: [1, 31]
+        zero: [1, 3]
+        one: [3, 1]
+        inverted: false
+    filters:
+      - delayed_off: 300ms
+
+  # Gang 3 Button (EV1527 / PT2262 24-bit)
+  - platform: remote_receiver
+    id: wall_switch_gang_3
+    name: "Wall Switch Gang 3"
+    icon: "mdi:light-switch"
+    rc_switch_raw:
+      code: "${wall_switch_gang_3_code}"
+      protocol:
+        pulse_length: ${ev1527_pulse_length_us}
+        sync: [1, 31]
+        zero: [1, 3]
+        one: [3, 1]
+        inverted: false
+    filters:
+      - delayed_off: 300ms
+
+button:
+  # Momentary button to toggle or pair the 10A AC RF Relay (Mode 1/2 toggle pairing)
+  - platform: template
+    name: "AC RF Relay 1 Toggle (Transmit RF)"
+    icon: "mdi:radio-tower"
+    on_press:
+      - script.execute:
+          id: transmit_ev1527_code
+          code_str: "${ac_relay_1_toggle_code}"
+
+  # Re-initialize CC1101 registers on demand if needed
+  - platform: template
+    name: "Reinitialize CC1101 Transceiver"
+    icon: "mdi:refresh"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          pinMode(19, INPUT_PULLUP);
+          delay(2);
+          ELECHOUSE_cc1101.setSpiPin(18, 19, 23, 5);
+          ELECHOUSE_cc1101.setGDO0(4);
+          ELECHOUSE_cc1101.Init();
+          ELECHOUSE_cc1101.setCCMode(0);
+          ELECHOUSE_cc1101.setModulation(2);
+          ELECHOUSE_cc1101.setMHZ(${rf_frequency_mhz});
+          ELECHOUSE_cc1101.setRxBW(${rf_rx_bw_khz});
+          ELECHOUSE_cc1101.setPA(${rf_tx_power_dbm});
+          ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D);
+          ELECHOUSE_cc1101.SetRx();
+          GPIO.enable_w1tc = (1ULL << 4);
+          delay(2);
+          bool ok = ELECHOUSE_cc1101.getCC1101();
+          id(cc1101_spi_status).publish_state(ok);
+
+switch:
+  # Optimistic switch entity for AC RF Relay configured in Latched / Separate ON-OFF mode
+  - platform: template
+    id: ac_rf_relay_1_switch
+    name: "AC RF Relay 1"
+    icon: "mdi:electric-switch"
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - script.execute:
+          id: transmit_ev1527_code
+          code_str: "${ac_relay_1_on_code}"
+    turn_off_action:
+      - script.execute:
+          id: transmit_ev1527_code
+          code_str: "${ac_relay_1_off_code}"

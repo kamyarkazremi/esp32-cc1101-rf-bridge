@@ -1,0 +1,12 @@
+# ESPHome / Credentials
+secrets.yaml
+.esphome/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Compiled firmware binaries
+*.bin
+*.elf

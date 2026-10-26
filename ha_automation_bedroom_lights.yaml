@@ -1,0 +1,45 @@
+id: rf433_wall_switch_bedroom_light
+alias: "RF433 Wall Switch - Bedroom Lights"
+description: >-
+  Single press toggles both bedroom lights in sync at their current brightness;
+  fast double press (within 1.3s) turns both ON at 100% brightness.
+mode: restart
+triggers:
+  - trigger: event
+    event_type: esphome.rf433_button_pressed
+    event_data:
+      gang: "1"
+conditions: []
+actions:
+  - choose:
+      # Fast double-press: Turn both bedroom lights ON at 100% brightness
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.event.data.action == 'double_press' }}"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id:
+                - light.bedroom_floor_lamp
+                - light.0xa4c138ff5c48f16c
+            data:
+              brightness_pct: 100
+      # Single-press while either light is ON: Turn both OFF
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ is_state('light.bedroom_floor_lamp', 'on') or
+                 is_state('light.0xa4c138ff5c48f16c', 'on') }}
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id:
+                - light.bedroom_floor_lamp
+                - light.0xa4c138ff5c48f16c
+    # Single-press while both lights are OFF: Turn both ON (restoring previous brightness)
+    default:
+      - action: light.turn_on
+        target:
+          entity_id:
+            - light.bedroom_floor_lamp
+            - light.0xa4c138ff5c48f16c
