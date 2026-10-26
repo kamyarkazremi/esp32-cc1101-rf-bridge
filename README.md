@@ -74,10 +74,28 @@ In `esp32-cc1101-rf-bridge.yaml`:
 
 ---
 
-## 5. Repository Files
+## 5. 3D-Printable Snap-Fit Enclosure (`enclosure/`)
+
+![3D-Printable Enclosure Preview](enclosure/rf_bridge_enclosure_preview.png)
+
+Located in [`enclosure/`](enclosure/), designed for **zero-support FDM printing** (PLA / PETG, 0.20 mm layer height on Bambu Lab A1):
+
+- **[`enclosure/rf_bridge_print_plate.stl`](enclosure/rf_bridge_print_plate.stl)** — Combined single-plate STL with both the bottom case and snap-fit lid oriented flat on the build plate.
+- **[`enclosure/rf_bridge_case_bottom.stl`](enclosure/rf_bridge_case_bottom.stl)** — Bottom enclosure (`68.8 × 58.8 × 30.2 mm` outer) featuring:
+  - Dedicated **ESP32 DevKit cradle** (`55.2 × 29.2 mm` pocket with `3.5 mm` pin-clearance ledges) aligned with a front USB-C / Micro-USB cutout + overmold relief.
+  - Dedicated **TI CC1101 8-pin module cradle** (`33.0 × 17.8 mm` anti-rotation rails) aligned with a rear **6.7 mm SMA bulkhead port** + `11.5 mm` hex nut/washer counterbore.
+  - **28 mm internal vertical clearance** to comfortably house arched female-to-female Dupont jumper wires.
+  - Two **M3 keyhole mounting slots** on the floor.
+- **[`enclosure/rf_bridge_case_lid.stl`](enclosure/rf_bridge_case_lid.stl)** — Snap-fit ventilated lid with 7 cooling louvers, onboard LED sight hole, and side pry slot.
+- **[`enclosure/esp32_cc1101_enclosure.scad`](enclosure/esp32_cc1101_enclosure.scad)** — Fully parametric OpenSCAD source.
+
+---
+
+## 6. Repository Files
 
 - [`esp32-cc1101-rf-bridge.yaml`](esp32-cc1101-rf-bridge.yaml) — Main ESPHome configuration (self-contained, flashed to ESP32 and synced to ESPHome Dashboard).
 - [`ha_automation_bedroom_lights.yaml`](ha_automation_bedroom_lights.yaml) — Home Assistant automation for synchronized Bedroom Light toggling and fast double-tap 100% brightness.
 - [`cc1101_rf_bridge.h`](cc1101_rf_bridge.h) — Standalone C++ reference header for CC1101 SPI initialization and mode switching.
 - [`compile_and_flash.py`](compile_and_flash.py) — Helper script that uploads the YAML to the ESPHome Dashboard server, streams the remote PlatformIO build, downloads `firmware.factory.bin`, and flashes `COM3` via `esptool`.
+- [`enclosure/`](enclosure/) — Parametric OpenSCAD design + ready-to-print `.stl` files (`rf_bridge_print_plate.stl`, `rf_bridge_case_bottom.stl`, `rf_bridge_case_lid.stl`).
 - [`secrets.yaml.example`](secrets.yaml.example) — Template for `secrets.yaml`.
